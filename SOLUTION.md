@@ -6,6 +6,25 @@ I focused Part 1 on the core production failure mode from the prompt: users on f
 
 Part 2 is submitted as a design note, as allowed by the prompt. I chose this over a fragile audio demo because the hard part is latency, ordering, buffering, distinct voices, and partial failure handling.
 
+## Reviewer quick path
+
+Core Part 1 files:
+
+- `backend/app/ask_jobs.py` — durable ask jobs, idempotency, context snapshots, and cancellation state.
+- `backend/app/workers.py` — background answer generation and persisted streaming chunks.
+- `backend/app/routes.py` — `/ask`, `/ask/{job_id}`, SSE streaming, cancellation, document management, and health check routes.
+- `backend/app/llm.py` — LLM prompts, including a document prompt-injection guard that treats uploaded content as untrusted data.
+- `frontend/app/hooks/useAskJob.ts` — reload recovery, SSE reconnect, double-submit guard, retry, cancel, and copy behavior.
+- `frontend/app/lib/storage.ts` — active ask request/job persistence for refresh recovery.
+
+Verification commands:
+
+```powershell
+python -m py_compile backend\main.py
+python -m unittest -v backend\test_main.py
+npm --prefix frontend run build
+```
+
 ## Part 1 audit: ranked production risks
 
 1. **`/ask` was synchronous and non-durable.** A dropped connection, tab close, or proxy timeout could lose an in-progress answer and push users to retry.
@@ -14,7 +33,8 @@ Part 2 is submitted as a design note, as allowed by the prompt. I chose this ove
 4. **No recovery after navigation/reload.** The frontend kept answer state in React memory only, so users could not come back to an in-progress result.
 5. **Failures were not persisted as user-visible state.** Provider errors or malformed responses became generic request failures instead of recoverable job states.
 6. **Citation trust was weak.** The prompt asked for citations, but the app did not structurally validate cited document IDs or expose source snippets.
-7. **Context construction will not scale.** Every active document is sent to the model. That is acceptable for this demo, but production needs retrieval/chunking/token budgeting.
+7. **Prompt injection from document content.** Uploaded documents are untrusted input and may contain instructions that try to override the grounding/refusal policy. Production should treat document text as data, strengthen prompt boundaries, and add post-answer support validation.
+8. **Context construction will not scale.** Every active document is sent to the model. That is acceptable for this demo, but production needs retrieval/chunking/token budgeting.
 
 ## What changed
 
@@ -38,6 +58,7 @@ Part 2 is submitted as a design note, as allowed by the prompt. I chose this ove
 - Added startup recovery: jobs left `running` after a server restart are marked `failed` with a clear retry message.
 - Added `/healthz` for database readiness, API-key configuration, active document count, and ask-job counts.
 - Added citation metadata: parse `[doc N]`, validate referenced document IDs exist, return source titles/snippets, and warn on missing/no citations.
+- Hardened the answer prompt against document prompt injection by explicitly treating uploaded document content as untrusted data, not instructions.
 - Added normalized exact content duplicate detection: same body/content is rejected even if the title changes, avoiding duplicate corpus entries and unnecessary summarization calls.
 - Added reversible document archive/restore. Archived docs are excluded from future ask context, while historical ask jobs retain their original context snapshots.
 - Refactored the backend into small modules under `backend/app/` while keeping `backend/main.py` as the compatibility entrypoint for `uvicorn main:app`.
@@ -74,6 +95,19 @@ A server-process restart is handled conservatively: interrupted `running` jobs a
 ### Avoids duplicate work on double-submit
 
 The frontend uses a synchronous submit guard and reuses the active idempotency key. The backend enforces idempotency with a unique key and rejects key reuse for a different question. This prevents duplicate paid LLM calls for the same active question.
+
+### Flow summary
+
+```text
+POST /ask + idempotency_key
+  -> create or return ask_jobs row
+  -> snapshot active documents into job context
+  -> background worker claims queued job
+  -> model streams tokens
+  -> backend appends answer text to SQLite
+  -> SSE stream replays persisted text and emits new chunks
+  -> frontend stores job_id and reconnects after reload
+```
 
 ## How to run
 
@@ -204,14 +238,15 @@ I also added a few high-leverage production-minded improvements around trust and
 ## Remaining failure modes and next steps
 
 1. **Server restarts are not resumable mid-token.** Running jobs are failed safely. A production worker could retry from chunk-level state.
-2. **`running_jobs` is process-local.** The database claim protects a single-process demo, but multi-worker production should use an external queue/worker.
+2. **Single-process worker assumption.** This take-home implementation assumes one backend process. The SQLite status transition from `queued` to `running` prevents duplicate claiming in the demo, but production should use an external queue/worker with leases or heartbeats because daemon threads and the in-memory `running_jobs` set do not coordinate across replicas or survive process exits.
 3. **Answers are stored as one growing text field.** Store chunks in an `ask_chunks` table with sequence numbers for stronger replay/auditability.
 4. **Citation validation is structural, not semantic.** The app verifies cited doc IDs and shows snippets, but does not prove every claim is supported. Add claim-level support checks for production.
-5. **All active documents are sent to the model.** Add chunking, retrieval, and token budgeting before large corpora.
-6. **Duplicate detection is exact, not semantic.** Same normalized body is blocked, but paraphrased or lightly rewritten duplicates can still be ingested.
-7. **Cancellation is cooperative.** The app stops local persistence/streaming, but cannot guarantee the provider stops billing immediately after a streaming request has started.
-8. **Retry creates a new job.** This keeps history and idempotency clean, but does not mutate failed/cancelled rows in place.
-9. **Tests are focused, not exhaustive.** I would add browser E2E tests for reload/reconnect UX and provider-failure cases before production.
+5. **Document prompt-injection defenses are prompt-level only.** The answer prompt tells the model to treat uploaded content as untrusted data, but production should also add retrieval isolation, claim verification, and tests with malicious documents that attempt to override instructions.
+6. **All active documents are sent to the model.** Add chunking, retrieval, and token budgeting before large corpora.
+7. **Duplicate detection is exact, not semantic.** Same normalized body is blocked, but paraphrased or lightly rewritten duplicates can still be ingested.
+8. **Cancellation is cooperative.** The app stops local persistence/streaming, but cannot guarantee the provider stops billing immediately after a streaming request has started.
+9. **Retry creates a new job.** This keeps history and idempotency clean, but does not mutate failed/cancelled rows in place.
+10. **Tests are focused, not exhaustive.** I would add browser E2E tests for reload/reconnect UX, prompt-injection cases, and provider-failure cases before production.
 
 ## Part 2: Audio design note
 
