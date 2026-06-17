@@ -5,10 +5,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en">
       <body
         style={{
-          fontFamily: "system-ui, -apple-system, sans-serif",
+          fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
           margin: 0,
-          padding: 24,
-          maxWidth: 760,
           lineHeight: 1.5,
         }}
       >

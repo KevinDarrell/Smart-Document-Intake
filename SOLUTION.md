@@ -1,91 +1,93 @@
 # Smart Document Intake — Solution
 
-## Requirement coverage
+## Summary
 
-### Part 1
+I focused Part 1 on the core production failure mode from the prompt: users on flaky mobile connections who double-submit, navigate away, and come back mid-answer. The implementation turns `/ask` into a durable, idempotent, streaming job flow backed by SQLite, with a minimal UI that can recover in-progress answers.
 
-Implemented:
+Part 2 is submitted as a design note, as allowed by the prompt. I chose this over a fragile audio demo because the hard part is latency, ordering, buffering, distinct voices, and partial failure handling.
 
-- **Stream the answer as it is generated:** `GET /ask/{job_id}/stream` returns Server-Sent Events, and the frontend renders chunks incrementally.
-- **Survive interruption:** `/ask` creates a durable SQLite-backed job, stores partial answer text as it arrives, and the frontend restores the active job from `localStorage` after reload/navigation.
-- **Never duplicate work on double-submit:** the frontend reuses a persisted active idempotency key, and the backend enforces idempotency with a unique key plus atomic `INSERT OR IGNORE`.
-- **Recover after coming back:** `GET /ask/{job_id}` returns the latest job status and accumulated answer; the frontend reconnects if the job is still active.
-- **Operational polish:** `GET /healthz` reports database reachability, API-key configuration, document count, and ask-job counts without exposing secrets.
+## Part 1 audit: ranked production risks
 
-### Part 2
+1. **`/ask` was synchronous and non-durable.** A dropped connection, tab close, or proxy timeout could lose an in-progress answer and push users to retry.
+2. **No idempotency for double-submit.** A double tap or network retry could trigger duplicate paid LLM work for the same question.
+3. **No streaming.** Users waited for the entire model response before seeing anything, which is especially poor on mobile.
+4. **No recovery after navigation/reload.** The frontend kept answer state in React memory only, so users could not come back to an in-progress result.
+5. **Failures were not persisted as user-visible state.** Provider errors or malformed responses became generic request failures instead of recoverable job states.
+6. **Citation trust was weak.** The prompt asked for citations, but the app did not structurally validate cited document IDs or expose source snippets.
+7. **Context construction will not scale.** Every active document is sent to the model. That is acceptable for this demo, but production needs retrieval/chunking/token budgeting.
 
-Submitted a design note rather than a fragile demo. The note focuses on low time-to-first-sound, ordered playback, distinct speaker voices, buffering, retry behavior, and validation.
-
-## Part 1: Ranked production audit
-
-1. **`/ask` was synchronous and non-durable.** The baseline tied the LLM request to one HTTP request. On a flaky mobile connection, a dropped tab or proxy timeout would lose the answer and encourage users to retry.
-2. **No idempotency meant double-submit duplicated work.** A double tap or network retry could trigger multiple paid LLM calls for the same question, with racing responses in the UI.
-3. **No streaming created poor perceived latency.** Users waited for the full model response before seeing anything, which is especially bad on mobile.
-4. **No recovery path after navigation.** The frontend held answer state only in React memory; a reload discarded in-progress work.
-5. **Provider and malformed-response failures were not represented as user-visible state.** Failures became generic request errors rather than persisted job status that can be shown or retried.
-6. **Grounding/citation is prompt-only.** The answer prompt asks the model to cite documents and refuse unsupported questions, but there is no structured citation validation yet.
-7. **Context construction will not scale.** Every full document is included in every question prompt. This is acceptable for the small demo corpus, but production would need chunking/retrieval and token budgets.
-
-## What I changed
-
-I changed `/ask` from a blocking request into a small durable job system backed by SQLite.
+## What changed
 
 ### Backend
 
-- Added an `ask_jobs` table with:
-  - `id`
-  - `idempotency_key`
-  - `question`
-  - `status` (`queued`, `running`, `completed`, `failed`)
-  - accumulated `answer`
-  - `error`
-  - document `context` snapshot
+- Replaced blocking `/ask` behavior with a durable SQLite `ask_jobs` state machine:
+  - `queued`, `running`, `completed`, `failed`, `cancelled`
+  - accumulated answer text
+  - stored error
+  - context snapshot
   - timestamps
-- `POST /ask` now accepts a client-generated `idempotency_key`.
-  - It uses atomic `INSERT OR IGNORE`, then always reads the row by `idempotency_key`.
-  - Repeated submissions with the same key return the same job instead of starting duplicate work.
-- The job stores a snapshot of the current document context at creation time, so the answer is generated against the document set that existed when the user asked.
-- The background worker claims jobs through the database by transitioning `queued -> running`. Only the process that successfully claims the row may call the LLM.
-- Added `GET /ask/{job_id}` to recover the latest persisted state.
-- Added `GET /ask/{job_id}/stream` using Server-Sent Events.
-  - On connect/reconnect it replays the persisted answer accumulated so far.
-  - It then streams new text as the background worker appends chunks to SQLite.
-  - It emits heartbeat comments to keep idle mobile/proxy connections alive.
-- The DeepSeek call now uses streaming mode and persists chunks incrementally.
-- SQLite is opened with WAL mode and a busy timeout to behave better under the small amount of concurrency this demo needs.
-- Added `GET /healthz` for a quick operational check: database status, DeepSeek configuration, document count, and ask-job counts.
-- On startup, interrupted `running` jobs are marked `failed` with a clear retry message rather than being left stuck forever or accidentally resumed by appending duplicate output.
+- Added client-provided idempotency keys for `/ask`:
+  - same key + same question returns the same job
+  - same key + different question returns `409 Conflict`
+  - concurrent same-key requests converge on one job via database uniqueness
+- Added `GET /ask/{job_id}` for recovery and `GET /ask/{job_id}/stream` for Server-Sent Events.
+- Streamed model chunks as they arrive and persisted chunks incrementally so reconnects replay the latest answer.
+- Added heartbeat SSE comments to keep idle connections alive.
+- Added `POST /ask/{job_id}/cancel` so users can stop generation; retry creates a fresh job to keep history and idempotency clean.
+- Stored a context snapshot per ask job so later corpus changes do not change the meaning of an already-started answer.
+- Added startup recovery: jobs left `running` after a server restart are marked `failed` with a clear retry message.
+- Added `/healthz` for database readiness, API-key configuration, active document count, and ask-job counts.
+- Added citation metadata: parse `[doc N]`, validate referenced document IDs exist, return source titles/snippets, and warn on missing/no citations.
+- Added normalized exact content duplicate detection: same body/content is rejected even if the title changes, avoiding duplicate corpus entries and unnecessary summarization calls.
+- Added reversible document archive/restore. Archived docs are excluded from future ask context, while historical ask jobs retain their original context snapshots.
+- Refactored the backend into small modules under `backend/app/` while keeping `backend/main.py` as the compatibility entrypoint for `uvicorn main:app`.
 
 ### Frontend
 
-- The Ask flow now creates and persists an idempotency key for the active submission.
-- Retries/double-invocations for the same active question reuse that key until the job becomes terminal.
-- It connects to the SSE stream and renders the answer incrementally.
-- It stores the active job id in `localStorage` while the job is not terminal.
-- On page load, it recovers an active job via `GET /ask/{job_id}` and reconnects to the stream if needed.
-- It has a synchronous `submittingRef` guard so rapid double taps are blocked before React state updates propagate.
-- The UI shows job status and recovery/progress messages.
-- Added reviewer-friendly UI polish: reliability badges, sample questions, empty-state guidance, and a Copy answer button.
+- Added idempotent ask submission with a persisted active request key.
+- Added SSE streaming and incremental answer rendering.
+- Added reload/navigation recovery using `localStorage` + `GET /ask/{job_id}`.
+- Added Stop generating and Retry question controls.
+- Added active/archived document views with Archive and Restore actions.
+- Added source snippets and citation warnings below completed answers.
+- Added duplicate-ingest messages, reliability badges, sample questions, and copy-answer support.
+- Refactored the UI into hooks/components:
+  - `hooks/useAskJob.ts`
+  - `hooks/useDocuments.ts`
+  - `components/AskCard.tsx`
+  - `components/DocumentList.tsx`
+  - `components/IntakeCard.tsx`
+  - `components/Sources.tsx`
 
-## How the new `/ask` handles the required scenarios
+## How `/ask` handles the required scenarios
 
 ### Streams the answer
 
-The backend calls DeepSeek with `stream=True`; chunks are appended to the `ask_jobs.answer` column. The SSE endpoint sends `chunk` events to the browser as text becomes available.
+`POST /ask` creates or returns an ask job. `GET /ask/{job_id}/stream` opens an SSE stream. The backend calls DeepSeek with `stream=True`, appends chunks to SQLite, and emits chunk events to the browser.
 
 ### Survives interruption
 
-Generation runs in a background thread independent of the SSE client connection. If the browser closes, reloads, or temporarily loses connectivity, the background job continues and the partial/final answer remains in SQLite.
+Generation runs in a background thread independent of the browser connection. If the user reloads, navigates away, or loses connectivity, the answer continues to be persisted. When the user returns, the frontend restores the active job from `localStorage`, fetches the latest job state, and reconnects to the stream if still active.
 
-When the user returns, the frontend reads the saved job id from `localStorage`, fetches the current job state, and reconnects to `/ask/{job_id}/stream` if the job is still active.
+A server-process restart is handled conservatively: interrupted `running` jobs are marked `failed` with a retry message. The app does not pretend it can resume a provider stream mid-token.
 
 ### Avoids duplicate work on double-submit
 
-The frontend avoids obvious duplicate clicks with a synchronous submit guard and by disabling the Ask button while active. More importantly, the backend stores `idempotency_key` with a unique constraint and uses atomic insert/read semantics so repeated submissions with the same key return the existing job.
-
-In production I would also include a user/session id and possibly a normalized question/document-set hash in the idempotency scope. For this take-home, a client-generated key demonstrates the core mechanism with minimal moving parts.
+The frontend uses a synchronous submit guard and reuses the active idempotency key. The backend enforces idempotency with a unique key and rejects key reuse for a different question. This prevents duplicate paid LLM calls for the same active question.
 
 ## How to run
+
+### Environment
+
+Create a local root `.env` file as the single place for local secrets/config, and do not commit it:
+
+```text
+DEEPSEEK_API_KEY=your_deepseek_api_key
+GEMINI_API_KEY=your_gemini_api_key
+NEXT_PUBLIC_BACKEND_URL=http://localhost:8000
+```
+
+`.env.example` documents the expected variables. The apps read these values from their process environments. If your shell or tooling does not automatically load the root `.env`, set the variables in the terminal before running each app. For Next.js specifically, `frontend/.env.local` is also supported for `NEXT_PUBLIC_BACKEND_URL`.
 
 ### Backend
 
@@ -97,50 +99,38 @@ python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
 $env:DEEPSEEK_API_KEY="your_deepseek_api_key"
+# Optional: only set this if the frontend is not running at the default http://localhost:3000
+# $env:FRONTEND_ORIGIN="http://localhost:3000"
 uvicorn main:app --reload --port 8000
 ```
 
-Health check in another terminal:
+Health check:
 
 ```powershell
 curl http://localhost:8000/healthz
 ```
 
-Expected shape:
+If `DEEPSEEK_API_KEY` is missing, `ok` and `deepseek_configured` are `false`; the server can start, but ingest/ask are not ready.
 
-```json
-{
-  "ok": true,
-  "database": "ok",
-  "deepseek_configured": true,
-  "documents": 0,
-  "ask_jobs": {
-    "queued": 0,
-    "running": 0,
-    "completed": 0,
-    "failed": 0
-  }
-}
+### Backend tests
+
+From the repository root:
+
+```powershell
+python -m py_compile backend\main.py
+python -m unittest -v backend\test_main.py
 ```
+
+The tests do not call DeepSeek. They cover idempotency, health readiness, startup recovery, SSE replay, citation metadata/snippets, duplicate content detection, archive/restore, and cancellation behavior.
 
 ### Frontend
 
-Open a second terminal from the repository root:
+In a second terminal:
 
 ```powershell
 cd frontend
 npm install
-```
-
-Create `frontend/.env.local`:
-
-```text
-NEXT_PUBLIC_BACKEND_URL=http://localhost:8000
-```
-
-Then run:
-
-```powershell
+$env:NEXT_PUBLIC_BACKEND_URL="http://localhost:8000" # if your shell/tooling did not load root .env
 npm run dev
 ```
 
@@ -150,190 +140,166 @@ Open:
 http://localhost:3000
 ```
 
-## Demo script
+Build check:
 
-For a quick reviewer demo:
-
-1. Open `http://localhost:8000/healthz` to confirm the backend and database are ready.
-2. Ingest the handbook and support SOP documents from `sample_documents.json`.
-3. Use one of the sample question buttons in the UI.
-4. Refresh the page while the answer is streaming to show persisted recovery.
-5. Use the fixed-key API check below to show backend idempotency.
+```powershell
+npm --prefix frontend run build
+```
 
 ## Manual verification checklist
 
 Use documents from `sample_documents.json`.
 
-### 1. Ingest documents
+1. **Ingest documents**
+   - Ingest 2-4 sample documents.
+   - Re-ingest the same body with the same title: expect duplicate rejection.
+   - Re-ingest the same body with a renamed title: expect duplicate rejection.
+   - Reuse the same title with different body: expect allowed ingest.
 
-In the UI:
+2. **Archive and restore**
+   - Archive a document and confirm it leaves Active.
+   - Switch to Archived and restore it.
+   - Archive it again and ask a question that would require it; the archived content should not be used for new answers.
 
-1. Copy a sample document title into **Title**.
-2. Copy its body into the textarea.
-3. Click **Ingest**.
-4. Repeat for 2-4 sample documents.
+3. **Streaming answer**
+   - Ask: `How many paid annual leave days do full-time employees get?`
+   - Expect incremental text, inline `[doc N]` citation, and Sources with a source snippet.
 
-Expected:
+4. **Recovery after reload**
+   - Ask a question that takes a few seconds.
+   - Refresh while generating.
+   - Expect the UI to recover the partial answer and reconnect.
 
-- Document count increases.
-- Each document shows a one-sentence summary after ingest.
+5. **Stop and retry**
+   - Ask a longer question.
+   - Click Stop generating.
+   - Expect status `cancelled`.
+   - Click Retry question and confirm a new answer streams.
 
-### 2. Streaming answer
+6. **Double-submit**
+   - Click Ask rapidly multiple times.
+   - Expect one active job and one backend job for the active idempotency key.
 
-Ask:
-
-```text
-How many paid annual leave days do full-time employees get?
-```
-
-Expected:
-
-- Status changes to queued/running/generating.
-- Answer appears incrementally, not only after the whole response finishes.
-- Final answer cites the relevant doc id, e.g. `[doc 1]`.
-
-### 3. Recovery after reload
-
-1. Ask a question that takes a few seconds.
-2. While it is generating, refresh the browser tab.
-
-Expected:
-
-- The UI says it recovered an in-progress answer.
-- Existing partial text is still visible.
-- The stream reconnects and continues until completion.
-
-### 4. Double-submit behavior
-
-1. Enter a question.
-2. Click **Ask** rapidly multiple times.
-
-Expected:
-
-- The UI only tracks one active job.
-- The job id remains the same for the active request.
-- The backend returns the same job for repeated submissions using the same idempotency key.
-
-Optional API-level check with a fixed key:
-
-```powershell
-$body = @{ question = "What are standard working hours?"; idempotency_key = "manual-test-12345" } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri http://localhost:8000/ask -ContentType "application/json" -Body $body
-Invoke-RestMethod -Method Post -Uri http://localhost:8000/ask -ContentType "application/json" -Body $body
-```
-
-Expected:
-
-- Both responses have the same `job_id`.
-
-### 5. Unsupported question refusal
-
-Ask:
-
-```text
-What is the company's 2028 revenue target?
-```
-
-Expected:
-
-- The model should say it does not know / the answer is not in the documents.
-- It should not invent a target.
+7. **Unsupported question refusal**
+   - Ask: `What is the company's 2028 revenue target?`
+   - Expect the model to say it does not know / the answer is not in the documents.
 
 ## What I prioritized
 
-I prioritized the exact Part 1 failure mode: mobile users on unreliable connections who retry or navigate away. The durable job model, SSE replay, and idempotency key directly address that.
+I prioritized the exact Part 1 reliability scenario: streaming answers, surviving client interruption, and avoiding duplicate work on double-submit.
 
-I kept the implementation intentionally small: one FastAPI file, SQLite, no Redis, no Celery, no vector DB. That makes the behavior easy to review and run in a take-home setting.
+I kept the implementation intentionally reviewable: SQLite, FastAPI background threads, SSE, and small modules. I avoided adding Redis/Celery/vector DB infrastructure because the take-home grades prioritization and effectiveness, not maximum architecture.
+
+I also added a few high-leverage production-minded improvements around trust and control: health check, citation snippets, content duplicate detection, archive/restore, cancel, retry, and focused backend tests.
 
 ## What I cut and why
 
-- **Vector search / embeddings:** useful for production scale, but not necessary to prove the requested streaming/durability behavior.
-- **Full citation validation:** important, but more time-consuming than the core transport/durability requirement. I kept strict prompt instructions and documented validation as next work.
-- **Multi-user auth/session scoping:** production would need it; this assignment app has no auth baseline.
-- **External queue/worker:** Redis/Celery/RQ would be more production-like but would add setup friction. SQLite plus a background thread is enough to demonstrate the state machine.
-- **Working audio implementation:** Part 2 explicitly allows a design note, and a strong design is less fragile than rushing codec/API integration.
+- **Vector search / embeddings:** useful at scale, but not required to prove durable streaming and idempotent ask behavior.
+- **Semantic citation validation:** important before real production, but larger than the core transport/durability requirement. I added structural citation validation and source snippets instead.
+- **Semantic near-duplicate detection:** exact normalized content dedupe is deterministic and safe. Paraphrase/near-duplicate detection would need embeddings or shingling plus a confirmation UX.
+- **Multi-user auth/session scoping:** production needs it, but the baseline app has no auth model.
+- **External queue/worker:** Redis/Celery/RQ would be more production-like, but SQLite + background thread proves the state machine without extra setup friction.
+- **Working audio demo:** Part 2 explicitly allows a design note, and a strong latency/ordering/failure design is less fragile than rushing codec/API integration.
 
 ## Remaining failure modes and next steps
 
-1. **Process restarts are handled conservatively but not resumably.** Startup marks interrupted `running` jobs as `failed` with a retry message. A production worker could resume or retry from chunk-level state instead.
-2. **In-memory `running_jobs` is only a local convenience.** The database claim protects `queued -> running`, but multiple production workers would still be better served by an external queue and worker process.
-3. **The answer is stored as one growing text field.** For more robust replay and auditing, store chunks in an `ask_chunks` table with sequence numbers.
-4. **Prompt-only grounding can hallucinate citations.** Add structured output, citation extraction, and post-validation that cited doc ids exist and support the answer.
-5. **All documents are sent to the model.** Add chunking, retrieval, and max-token budgeting before real usage.
-6. **No cancellation endpoint.** Users cannot stop an unwanted generation yet.
-7. **No automated tests.** I would add tests for idempotency, SSE replay, failed jobs, and reconnect behavior.
+1. **Server restarts are not resumable mid-token.** Running jobs are failed safely. A production worker could retry from chunk-level state.
+2. **`running_jobs` is process-local.** The database claim protects a single-process demo, but multi-worker production should use an external queue/worker.
+3. **Answers are stored as one growing text field.** Store chunks in an `ask_chunks` table with sequence numbers for stronger replay/auditability.
+4. **Citation validation is structural, not semantic.** The app verifies cited doc IDs and shows snippets, but does not prove every claim is supported. Add claim-level support checks for production.
+5. **All active documents are sent to the model.** Add chunking, retrieval, and token budgeting before large corpora.
+6. **Duplicate detection is exact, not semantic.** Same normalized body is blocked, but paraphrased or lightly rewritten duplicates can still be ingested.
+7. **Cancellation is cooperative.** The app stops local persistence/streaming, but cannot guarantee the provider stops billing immediately after a streaming request has started.
+8. **Retry creates a new job.** This keeps history and idempotency clean, but does not mutate failed/cancelled rows in place.
+9. **Tests are focused, not exhaustive.** I would add browser E2E tests for reload/reconnect UX and provider-failure cases before production.
 
 ## Part 2: Audio design note
 
-Goal: turn a short two-speaker dialogue into audio with low time-to-first-sound, smooth playback, and distinct voices.
+Goal: turn a 6-10 turn, two-speaker roleplay into audio that starts quickly, plays smoothly, preserves turn order, and uses distinct voices.
 
 ### Proposed architecture
+
+Use segmented generation instead of one large audio file.
 
 1. Parse the dialogue into ordered turns:
 
 ```json
-{
-  "turnIndex": 0,
-  "speaker": "rep",
-  "text": "Hi Pak Andi..."
-}
+{ "turn_index": 0, "speaker": "rep", "text": "Hi Pak Andi..." }
 ```
 
-2. Assign a stable voice per speaker:
+2. Assign a stable Gemini voice per speaker:
+
+```json
+{ "rep": "voice_a", "client": "voice_b" }
+```
+
+3. Create an audio dialogue job with a manifest:
 
 ```json
 {
-  "rep": "voice_a",
-  "client": "voice_b"
-}
-```
-
-3. Generate audio per turn as independent segments using Gemini TTS.
-
-4. Start playback as soon as turn 0 is ready, instead of waiting for the entire dialogue.
-
-5. While turn 0 is playing, generate turns 1-N in parallel with a small concurrency limit.
-
-6. Maintain a playback buffer/manifest:
-
-```json
-{
-  "dialogueId": "...",
+  "dialogue_id": "dlg_123",
+  "status": "generating",
   "segments": [
-    { "turnIndex": 0, "speaker": "rep", "status": "ready", "url": "/audio/0.wav" },
-    { "turnIndex": 1, "speaker": "client", "status": "generating", "url": null }
+    { "turn_index": 0, "speaker": "rep", "status": "queued", "audio_url": null },
+    { "turn_index": 1, "speaker": "client", "status": "queued", "audio_url": null }
   ]
 }
 ```
 
-7. The player consumes segments in order. It may generate ahead out-of-order, but playback order remains strict.
+4. Generate turn 0 first and start playback as soon as it is ready.
+5. Generate the next 2-3 turns concurrently while playback begins.
+6. Stream manifest updates to the frontend with SSE or poll the manifest if SSE is unavailable.
+7. The player only plays segments in `turn_index` order, even if later turns finish first.
+
+Possible API shape:
+
+```http
+POST /audio/dialogues
+GET  /audio/dialogues/{dialogue_id}
+GET  /audio/dialogues/{dialogue_id}/events
+GET  /audio/segments/{segment_id}
+```
 
 ### Low-latency strategy
 
-- Generate the first turn immediately at highest priority.
-- Begin playback once the first segment is ready.
-- Generate the next 2-3 turns concurrently to avoid gaps.
-- Use a small jitter buffer: do not start if there is only a tiny amount of audio and the next segment is far behind, but avoid waiting for the full dialogue.
-- Cache generated segments by `(voice, text hash, model settings)` so retries or replays do not regenerate audio.
+- Prioritize segment 0 for low time-to-first-sound.
+- Start playback when segment 0 is ready instead of waiting for the full dialogue.
+- Generate a small lookahead buffer, for example 2-3 segments, to reduce gaps between turns.
+- Use a short jitter buffer for very short first turns so playback does not immediately stall.
+- Cache segments by `voice + normalized_text + model + audio_settings` so retries/replays do not regenerate ready audio.
+
+### Ordering and buffering
+
+Generation can finish out of order, but playback cannot. The manifest is the source of truth:
+
+```text
+queued -> generating -> ready
+                  \-> retrying -> ready
+                  \-> failed
+```
+
+If segment 2 finishes before segment 1, segment 2 stays buffered. The player waits for segment 1 or pauses with a clear retry state if segment 1 fails.
 
 ### Partial failure behavior
 
-- If turn N fails but turn N-1 is playing, retry turn N in the background.
-- If retry still fails before playback reaches it, pause with a clear “regenerating segment” message rather than skipping silently.
-- If a later turn is ready before an earlier failed turn, keep it buffered but do not play out of order.
-- Persist the manifest so reloads can resume without regenerating completed segments.
+- Retry a failed segment with bounded backoff.
+- Keep ready later segments buffered, but do not skip ahead silently.
+- If playback reaches a failed/retrying segment, pause with “regenerating this line.”
+- Persist the manifest so reloads can resume ready segments without regenerating them.
+- If the same dialogue is submitted twice, idempotency can return the existing dialogue job or reuse cached segments.
 
-### Validation
+### Validation plan
 
-I would measure:
+I would validate:
 
-- Time to first sound.
-- Gap duration between turns.
-- Voice consistency per speaker.
-- Correct playback order under out-of-order generation.
-- Behavior when one segment generation fails.
-- Behavior after browser reload mid-dialogue.
+- time to first sound
+- gap duration between turns
+- voice consistency per speaker
+- strict playback order under out-of-order generation
+- retry behavior for a failed segment
+- reload recovery mid-dialogue
+- duplicate dialogue submission/caching behavior
 
 ### Why design note over demo
 
-The assignment says a strong design note is better than a fragile demo. The tricky part is not just calling a TTS API; it is ordering, buffering, retrying, preserving distinct speaker voices, and starting playback quickly without causing mid-dialogue stalls. I chose to explain that system clearly rather than add a brittle partially working audio path.
+The prompt says a strong design note beats a fragile demo. The production risk is not just calling Gemini TTS; it is making playback start fast while preserving speaker identity, turn order, buffering, retry behavior, and recovery. This design keeps the first slice simple and reliable while leaving room for more advanced audio streaming later.
