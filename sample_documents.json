@@ -1,0 +1,22 @@
+[
+  {
+    "id": "doc-001",
+    "title": "Employee Handbook — Leave & Working Hours",
+    "body": "Full-time employees are entitled to 12 days of paid annual leave per year, which does not carry over into the following year. Standard working hours are 09:00 to 18:00, Monday to Friday, with a one-hour lunch break. Remote work is permitted up to two days per week with manager approval. Leave requests must be submitted through the HR portal at least seven days in advance."
+  },
+  {
+    "id": "doc-002",
+    "title": "Product Overview — Atlas Knowledge Platform",
+    "body": "Atlas is an internal knowledge platform that lets teams capture institutional knowledge and ask questions about it in natural language. Core features are: document ingestion, automatic summarization, semantic search, and a chat assistant that answers strictly from approved company content. Atlas supports English and Bahasa Indonesia. It is designed for mid-sized companies and is administered by a designated knowledge manager in each department."
+  },
+  {
+    "id": "doc-003",
+    "title": "Support SOP — Ticket Escalation",
+    "body": "Incoming support tickets are triaged within two business hours. Priority levels are P1 (service down), P2 (major feature broken), and P3 (minor issue). P1 tickets are escalated immediately to the on-call engineer and must be acknowledged within 15 minutes. P2 tickets carry a four-hour response target; P3 tickets, two business days. Any ticket unresolved for 48 hours is automatically escalated to the support lead."
+  },
+  {
+    "id": "doc-004",
+    "title": "Security Policy — Accounts & Data",
+    "body": "All staff must enable two-factor authentication on company accounts. Passwords must be at least 12 characters and are rotated every 90 days. Customer data may never be copied to personal devices or personal cloud storage. Suspected phishing emails must be reported to the security team within one hour. Access to production systems is granted on a least-privilege basis and reviewed quarterly."
+  }
+]

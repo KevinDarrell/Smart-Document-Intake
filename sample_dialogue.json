@@ -1,0 +1,14 @@
+{
+  "title": "Discovery call — sales coaching roleplay",
+  "speakers": ["rep", "client"],
+  "turns": [
+    { "speaker": "rep", "text": "Hi Pak Andi, thanks for making the time. Before I dive in — what prompted you to take this call today?" },
+    { "speaker": "client", "text": "Honestly, our sales team's results have been inconsistent. Some months are great, some are flat, and I can't tell why." },
+    { "speaker": "rep", "text": "That inconsistency is frustrating. When you compare your top performers to the rest, what do you think they're doing differently?" },
+    { "speaker": "client", "text": "That's the thing — I'm not sure. The good ones just seem to get it, but we've never written down what 'it' is." },
+    { "speaker": "rep", "text": "So the playbook lives in a few people's heads, and when they're busy or they leave, it walks out the door." },
+    { "speaker": "client", "text": "Exactly. We lost a senior rep last quarter and three deals stalled because no one knew how he handled those accounts." },
+    { "speaker": "rep", "text": "If we could capture how your best reps actually sell, and train the rest on it, what would that be worth to you this year?" },
+    { "speaker": "client", "text": "If it lifted the bottom half even halfway to the top, that's easily a few billion rupiah in extra revenue." }
+  ]
+}
